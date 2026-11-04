@@ -1,0 +1,52 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [7 0 R 8 0 R 9 0 R] >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 191 >>
+stream
+BT /F1 20 Tf 50 750 Td (Zahtevek za zavarovalnino) Tj ET
+BT /F1 12 Tf 50 678 Td (Znesek (EUR)) Tj ET
+BT /F1 12 Tf 50 598 Td (Vrsta skode) Tj ET
+BT /F1 12 Tf 50 518 Td (Stevilka police) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Fields [7 0 R 8 0 R 9 0 R] /DA (/Helv 12 Tf 0 g) /DR << /Font << /Helv 4 0 R >> >> >>
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (znesek) /V () /Rect [50 650 350 672] /P 3 0 R /F 4 /DA (/Helv 12 Tf 0 g) >>
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Ch /T (vrsta_skode) /V () /Rect [50 570 350 592] /P 3 0 R /F 4 /DA (/Helv 12 Tf 0 g) /Ff 131072 /Opt [(vozilo) (dom) (oprema) (poplava)] >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (stevilka_police) /V () /Rect [50 490 350 512] /P 3 0 R /F 4 /DA (/Helv 12 Tf 0 g) >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000015 00000 n 
+0000000080 00000 n 
+0000000137 00000 n 
+0000000291 00000 n 
+0000000361 00000 n 
+0000000602 00000 n 
+0000000707 00000 n 
+0000000843 00000 n 
+0000001036 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+1181
+%%EOF

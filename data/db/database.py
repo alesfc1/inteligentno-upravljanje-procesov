@@ -13,8 +13,10 @@ EVENT_COLUMNS = (
     "role",
     "source",
     "status",
-    "claim_amount_eur",
     "documents_complete",
+    "znesek",
+    "vrsta_skode",
+    "stevilka_police",
 )
 
 
@@ -35,7 +37,7 @@ def create_database() -> None:
                 case_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 description TEXT NOT NULL,
-                claim_amount_eur REAL NOT NULL CHECK (claim_amount_eur >= 0),
+                znesek REAL NOT NULL CHECK (znesek >= 0),
                 applicant TEXT NOT NULL,
                 status TEXT NOT NULL,
                 assigned_to TEXT,
@@ -54,8 +56,10 @@ def create_database() -> None:
                 role TEXT NOT NULL,
                 source TEXT NOT NULL CHECK (source IN ('system', 'manual')),
                 status TEXT NOT NULL,
-                claim_amount_eur REAL NOT NULL,
                 documents_complete INTEGER,
+                znesek REAL,
+                vrsta_skode TEXT,
+                stevilka_police TEXT,
                 UNIQUE (case_id, activity, timestamp)
             );
             CREATE TABLE IF NOT EXISTS documents (
@@ -76,6 +80,63 @@ def create_database() -> None:
         }
         if "assigned_to" not in columns:
             connection.execute("ALTER TABLE cases ADD COLUMN assigned_to TEXT")
+        for column, declaration in {
+            "znesek": "REAL NOT NULL DEFAULT 0",
+            "vrsta_skode": "TEXT",
+            "stevilka_police": "TEXT",
+        }.items():
+            if column not in columns:
+                connection.execute(f"ALTER TABLE cases ADD COLUMN {column} {declaration}")
+        if "claim_amount_eur" in columns:
+            connection.execute(
+                "UPDATE cases SET znesek = claim_amount_eur WHERE znesek IS NULL OR znesek = 0"
+            )
+            try:
+                connection.execute("ALTER TABLE cases DROP COLUMN claim_amount_eur")
+            except sqlite3.OperationalError:
+                pass
+        event_columns = {row["name"] for row in connection.execute("PRAGMA table_info(events)").fetchall()}
+        for column, declaration in {
+            "vrsta_skode": "TEXT",
+            "stevilka_police": "TEXT",
+        }.items():
+            if column not in event_columns:
+                connection.execute(f"ALTER TABLE events ADD COLUMN {column} {declaration}")
+        if "znesek" not in event_columns:
+            connection.execute("ALTER TABLE events ADD COLUMN znesek REAL")
+        if "claim_amount_eur" in event_columns:
+            connection.execute(
+                "UPDATE events SET znesek = claim_amount_eur WHERE znesek IS NULL OR znesek = 0"
+            )
+            try:
+                connection.execute("ALTER TABLE events DROP COLUMN claim_amount_eur")
+            except sqlite3.OperationalError:
+                pass
+        connection.execute(
+            """UPDATE events
+               SET vrsta_skode = COALESCE(vrsta_skode, (
+                       SELECT cases.vrsta_skode FROM cases
+                       WHERE cases.case_id = events.case_id)),
+                   stevilka_police = COALESCE(stevilka_police, (
+                       SELECT cases.stevilka_police FROM cases
+                       WHERE cases.case_id = events.case_id))
+               WHERE activity = 'Obvestilo stranki'
+                 AND (vrsta_skode IS NULL OR stevilka_police IS NULL)"""
+        )
+        connection.execute(
+            """UPDATE cases
+               SET vrsta_skode = COALESCE(vrsta_skode, (
+                       SELECT events.vrsta_skode FROM events
+                       WHERE events.case_id = cases.case_id
+                         AND events.activity = 'Oddaja zahtevka'
+                       ORDER BY events.timestamp, events.id LIMIT 1)),
+                   stevilka_police = COALESCE(stevilka_police, (
+                       SELECT events.stevilka_police FROM events
+                       WHERE events.case_id = cases.case_id
+                         AND events.activity = 'Oddaja zahtevka'
+                       ORDER BY events.timestamp, events.id LIMIT 1))
+               WHERE vrsta_skode IS NULL OR stevilka_police IS NULL"""
+        )
 
 
 def next_case_id(connection: sqlite3.Connection) -> str:
@@ -97,15 +158,18 @@ def insert_event(
     role: str,
     source: str,
     status: str,
-    claim_amount_eur: float,
+    znesek: float | None,
     documents_complete: bool | None,
+    vrsta_skode: str | None = None,
+    stevilka_police: str | None = None,
 ) -> None:
     connection.execute(
         """
         INSERT INTO events (
             case_id, activity, timestamp, resource, role, source, status,
-            claim_amount_eur, documents_complete
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            znesek, documents_complete, vrsta_skode,
+            stevilka_police
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             case_id,
@@ -115,8 +179,9 @@ def insert_event(
             role,
             source,
             status,
-            claim_amount_eur,
+            znesek,
             None if documents_complete is None else int(documents_complete),
+            vrsta_skode, stevilka_police,
         ),
     )
 

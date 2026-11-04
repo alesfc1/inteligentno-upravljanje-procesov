@@ -1,9 +1,11 @@
 import csv
 import io
+import math
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+from pypdf import PdfReader
 
 from data.db.database import (
     EVENT_COLUMNS,
@@ -22,6 +24,8 @@ ROLE_IDENTITIES = {
     "referent": ["referent_01", "referent_02", "referent_03"],
     "vodja": ["vodja_01"],
 }
+PDF_FIELDS = ("znesek", "vrsta_skode", "stevilka_police")
+CLAIM_TYPES = {"vozilo", "dom", "oprema", "poplava"}
 
 STATUS_LABELS = {
     "oddano": "Oddano",
@@ -54,6 +58,33 @@ def pdf_file_data(uploaded_file) -> tuple[str, bytes]:
     return Path(uploaded_file.name).name, file_bytes
 
 
+def read_claim_form(uploaded_file) -> tuple[dict, list[str]]:
+    """Prebere in preveri interaktivna polja PDF obrazca."""
+    _, content = pdf_file_data(uploaded_file)
+    try:
+        fields = PdfReader(io.BytesIO(content)).get_fields() or {}
+    except Exception as error:
+        raise ValueError("PDF obrazca ni mogoče prebrati.") from error
+    values = {name: fields.get(name, {}).get("/V") for name in PDF_FIELDS}
+    errors = []
+    if values["znesek"] in (None, ""):
+        errors.append("Manjka znesek.")
+    else:
+        try:
+            values["znesek"] = float(str(values["znesek"]).replace(",", "."))
+            if not math.isfinite(values["znesek"]) or values["znesek"] <= 0:
+                errors.append("Znesek mora biti večji od 0 EUR.")
+        except (TypeError, ValueError):
+            errors.append("Znesek ni veljavno število.")
+    values["vrsta_skode"] = str(values["vrsta_skode"] or "").strip()
+    if values["vrsta_skode"] not in CLAIM_TYPES:
+        errors.append("Izberite dovoljeno vrsto škode.")
+    values["stevilka_police"] = str(values["stevilka_police"] or "").strip()
+    if not values["stevilka_police"]:
+        errors.append("Manjka številka police.")
+    return values, errors
+
+
 def save_document(
     connection,
     *,
@@ -78,15 +109,17 @@ def save_document(
 
 def create_case(
     *,
-    title: str,
-    description: str,
-    amount: float,
     applicant: str,
     uploaded_file,
 ) -> str:
-    """Ustvari zahtevek, shrani PDF in zabeleži sistemska dogodka."""
+    """Ustvari zahtevek iz PDF obrazca in samodejno preveri podatke."""
     safe_name, _ = pdf_file_data(uploaded_file)
+    values, errors = read_claim_form(uploaded_file)
+    amount = values["znesek"] if isinstance(values["znesek"], float) else 0.0
+    title = f"Zahtevek – {values['vrsta_skode'] or 'neznana škoda'}"
+    description = f"Polica: {values['stevilka_police'] or 'ni navedena'}"
     created_at = now_iso()
+    validation_status = "v_pregledu" if not errors else "caka_na_dopolnitev"
 
     with get_connection() as connection:
         case_id = next_case_id(connection)
@@ -96,10 +129,10 @@ def create_case(
             connection.execute(
                 """
                 INSERT INTO cases (
-                    case_id, title, description, claim_amount_eur, applicant,
+                    case_id, title, description, znesek, applicant,
                     status, documents_complete, document_name, document_path,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, vrsta_skode, stevilka_police
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     case_id,
@@ -107,11 +140,13 @@ def create_case(
                     description.strip(),
                     amount,
                     applicant,
-                    "oddano",
-                    None,
+                    validation_status,
+                    not errors,
                     safe_name,
                     str(destination),
                     created_at,
+                    values["vrsta_skode"],
+                    values["stevilka_police"],
                 ),
             )
             save_document(
@@ -130,30 +165,23 @@ def create_case(
                 role="stranka",
                 source="manual", 
                 status="oddano",
-                claim_amount_eur=amount,
-                documents_complete=None,
+                documents_complete=not errors,
+                znesek=amount, vrsta_skode=values["vrsta_skode"],
+                stevilka_police=values["stevilka_police"],
             )
 
-            check_time = now_iso()
-            connection.execute(
-                """
-                UPDATE cases
-                SET status = ?, documents_complete = ?
-                WHERE case_id = ?
-                """,
-                ("v_pregledu", 1, case_id),
-            )
             insert_event(
                 connection,
                 case_id=case_id,
                 activity="Samodejno preverjanje",
-                timestamp=check_time,
+                timestamp=now_iso(),
                 resource="sistem",
                 role="sistem",
                 source="system",
-                status="v_pregledu",
-                claim_amount_eur=amount,
-                documents_complete=True,
+                status=validation_status,
+                documents_complete=not errors,
+                znesek=amount, vrsta_skode=values["vrsta_skode"],
+                stevilka_police=values["stevilka_police"],
             )
         except Exception:
             
@@ -241,13 +269,21 @@ def apply_action(
 
         if action == "submit_completion":
             if uploaded_file is None:
-                raise ValueError("Za dopolnitev izberite PDF dokument.")
+                raise ValueError("Naložite izpolnjen PDF obrazec dopolnitve.")
+            values, errors = read_claim_form(uploaded_file)
             save_document(
                 connection,
                 case_id=case_id,
                 uploaded_file=uploaded_file,
                 document_type="dopolnitev dokumentacije",
                 file_prefix="dopolnitev",
+            )
+            new_status = "v_pregledu" if not errors else "caka_na_dopolnitev"
+            connection.execute(
+                """UPDATE cases SET znesek=?, vrsta_skode=?,
+                   stevilka_police=? WHERE case_id=?""",
+                (values["znesek"] if isinstance(values["znesek"], float) else 0.0,
+                 values["vrsta_skode"], values["stevilka_police"], case_id),
             )
 
         timestamp = now_iso()
@@ -258,19 +294,17 @@ def apply_action(
                 (resource, case_id),
             )
 
-        documents_complete = (
-            True
-            if action in {"approve", "manager_approve"}
-            else (
-                False
-                if action in {"request_completion", "submit_completion"}
-                else (
-                    None
-                    if case["documents_complete"] is None
-                    else bool(case["documents_complete"])
-                )
+        if action == "submit_completion":
+            documents_complete = not errors
+        elif action in {"approve", "manager_approve"}:
+            documents_complete = True
+        elif action == "request_completion":
+            documents_complete = False
+        else:
+            documents_complete = (
+                None if case["documents_complete"] is None
+                else bool(case["documents_complete"])
             )
-        )
         connection.execute(
             """
             UPDATE cases
@@ -291,8 +325,10 @@ def apply_action(
             role=role,
             source=event_source,
             status=new_status,
-            claim_amount_eur=case["claim_amount_eur"],
             documents_complete=documents_complete,
+            znesek=(values["znesek"] if action == "submit_completion" else case["znesek"]),
+            vrsta_skode=(values["vrsta_skode"] if action == "submit_completion" else case["vrsta_skode"]),
+            stevilka_police=(values["stevilka_police"] if action == "submit_completion" else case["stevilka_police"]),
         )
 
         if action in {"approve", "manager_approve", "reject", "withdraw"}:
@@ -305,8 +341,10 @@ def apply_action(
                 role="sistem",
                 source="system",
                 status=new_status,
-                claim_amount_eur=case["claim_amount_eur"],
+                znesek=case["znesek"],
                 documents_complete=documents_complete,
+                vrsta_skode=case["vrsta_skode"],
+                stevilka_police=case["stevilka_police"],
             )
 
 
@@ -323,32 +361,29 @@ def events_csv() -> str:
 
 def render_submission(identity: str) -> None:
     st.subheader("Oddaja zahtevka")
+    st.caption("Izpolnite polja v PDF obrazcu in ga naložite. Podatkov ni treba prepisati.")
+    template = Path(__file__).parent / "data" / "forms" / "obrazec_zahtevka.pdf"
+    if template.exists():
+        st.download_button("Prenesi PDF obrazec", template.read_bytes(),
+                           file_name=template.name, mime="application/pdf")
     with st.form("new_case_form", clear_on_submit=True):
-        title = st.text_input("Naslov zahtevka")
-        description = st.text_area("Opis škode")
-        amount = st.number_input(
-            "Znesek škode (EUR)", min_value=0.0, step=100.0
-        )
-        document = st.file_uploader("Dokumentacija (PDF)", type=["pdf"])
+        document = st.file_uploader("Izpolnjen PDF obrazec", type=["pdf"])
         submitted = st.form_submit_button("Oddaj zahtevek")
 
     if submitted:
-        if not title.strip() or not description.strip():
-            st.error("Naslov in opis sta obvezna.")
-        elif document is None:
+        if document is None:
             st.error("Priložite PDF dokument.")
         else:
             try:
                 case_id = create_case(
-                    title=title,
-                    description=description,
-                    amount=amount,
                     applicant=identity,
                     uploaded_file=document,
                 )
-                st.success(
-                    f"Zahtevek {case_id} je oddan in samodejno preverjen."
-                )
+                case = next(c for c in get_cases() if c["case_id"] == case_id)
+                if case["status"] == "caka_na_dopolnitev":
+                    st.warning(f"Zahtevek {case_id} čaka na dopolnitev. Preverite obvezna polja obrazca.")
+                else:
+                    st.success(f"Zahtevek {case_id} je oddan in samodejno preverjen.")
                 st.rerun()
             except (ValueError, OSError) as error:
                 st.error(f"Zahtevka ni bilo mogoče oddati: {error}")
@@ -372,7 +407,9 @@ def render_cases(identity: str, role: str) -> None:
             st.markdown(
                 f"**{case['case_id']} - {case['title']}**  \n"
                 f"Stanje: **{status_label(case['status'])}** | "
-                f"Znesek: **{case['claim_amount_eur']:.2f} EUR**"
+                f"Znesek: **{case['znesek'] or 0:.2f} EUR** | "
+                f"Vrsta: **{case['vrsta_skode'] or '—'}** | "
+                f"Polica: **{case['stevilka_police'] or '—'}**"
             )
             assigned = case["assigned_to"] or "ni prevzet"
             st.caption(
@@ -395,6 +432,7 @@ def render_cases(identity: str, role: str) -> None:
                             role,
                             completion_document,
                         )
+                        st.success("Dopolnitev je sprejeta." if case["documents_complete"] else "Obrazec še ni popoln; zahtevek ostaja v dopolnitvi.")
                         st.rerun()
                     except (ValueError, PermissionError) as error:
                         st.error(str(error))
@@ -474,7 +512,7 @@ def render_event_log() -> None:
             hide_index=True,
         )
     st.download_button(
-        "Izvozi celoten dnevnik v CSV",
+        "Izvozi dnevnik v CSV",
         data=events_csv(),
         file_name="dnevnik.csv",
         mime="text/csv",
@@ -488,7 +526,6 @@ def main() -> None:
     )
     create_database()
     st.title("Obravnava zavarovalniškega zahtevka")
-    st.caption("Ogrodje procesa z dnevnikom dogodkov in srečno potjo.")
 
     with st.sidebar:
         st.header("Izbira uporabnika")
