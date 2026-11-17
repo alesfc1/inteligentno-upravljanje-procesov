@@ -26,12 +26,22 @@ ROLE_IDENTITIES = {
 }
 PDF_FIELDS = ("znesek", "vrsta_skode", "stevilka_police")
 CLAIM_TYPES = {"vozilo", "dom", "oprema", "poplava"}
+REFERENT_LIMIT_EUR = 5_000.0
+MANUAL_EVENT_TYPES = (
+    "Telefonski klic s stranko",
+    "Poslana e-pošta stranki",
+    "Posvet s sodelavcem",
+    "Pogovor z vodjo",
+    "Telefonski klic s cenilcem",
+)
 
 STATUS_LABELS = {
     "oddano": "Oddano",
     "v_pregledu": "V pregledu",
     "caka_na_dopolnitev": "Čaka na dopolnitev",
     "predano_vodji": "Predano vodji",
+    "pregled_vodje": "V pregledu pri vodji",
+    "za_pregled": "Čaka na ponovni pregled",
     "odobren": "Odobren",
     "zavrnjen": "Zavrnjen",
     "umik_zahtevka": "Umik zahtevka",
@@ -163,7 +173,7 @@ def create_case(
                 timestamp=created_at,
                 resource=applicant,
                 role="stranka",
-                source="manual", 
+                source="system",
                 status="oddano",
                 documents_complete=not errors,
                 znesek=amount, vrsta_skode=values["vrsta_skode"],
@@ -198,13 +208,14 @@ def apply_action(
     resource: str,
     role: str,
     uploaded_file=None,
+    unrestricted: bool = False,
 ) -> None:
     """
     Preveri dovoljenja in stanje, izvede eno akcijo ter zabeleži dogodek.
     Opomba: seznam prehodov naj ostane usklajen s konceptualnim dnevnikom iz 3. naloge.
     """
     actions = {
-        "take": ("Prevzem zahtevka", "v_pregledu", "referent"),
+        "take": ("Prevzem zahtevka", None, "referent"),
         "approve": ("Odobritev referenta", "zakljucen_odobren", "referent"),
         "reject": ("Zavrnitev referenta", "zakljucen_zavrnjen", "referent"),
         "request_completion": (
@@ -213,7 +224,8 @@ def apply_action(
             "referent",
         ),
         "handoff": ("Predaja vodji", "predano_vodji", "referent"),
-        "manager_review": ("Pregled vodje", "v_pregledu", "vodja"),
+        "manager_review": ("Pregled vodje", "pregled_vodje", "vodja"),
+        "review": ("Pregled referenta", "v_pregledu", "referent"),
         "manager_approve": (
             "Odobritev vodje",
             "zakljucen_odobren",
@@ -227,7 +239,7 @@ def apply_action(
         raise ValueError("Neznana akcija.")
 
     activity, new_status, expected_role = actions[action]
-    if role != expected_role:
+    if role != expected_role and not unrestricted:
         raise PermissionError("Za to akcijo izbrana vloga ni dovoljena.")
 
     with get_connection() as connection:
@@ -237,35 +249,47 @@ def apply_action(
         if case is None:
             raise ValueError("Zahtevek ne obstaja.")
 
+        if action == "take":
+            # Prevzem samo dodeli zahtevek; ne spremeni faze procesa.
+            new_status = case["status"]
+
         allowed_statuses = {
-            "take": {"v_pregledu"},
+            "take": {"v_pregledu", "caka_na_dopolnitev", "za_pregled"},
             "approve": {"v_pregledu"},
             "reject": {"v_pregledu"},
             "request_completion": {"v_pregledu"},
             "handoff": {"v_pregledu"},
             "manager_review": {"predano_vodji"},
-            "manager_approve": {"v_pregledu"},
+            "review": {"za_pregled"},
+            "manager_approve": {"pregled_vodje"},
             "withdraw": {"v_pregledu"},
             "submit_completion": {"caka_na_dopolnitev"},
         }
-        if case["status"] not in allowed_statuses[action]:
+        if case["status"].startswith("zakljucen_"):
+            raise ValueError("Zahtevek je že zaključen.")
+        if not unrestricted and case["status"] not in allowed_statuses[action]:
             raise ValueError("Akcija v trenutnem stanju ni dovoljena.")
 
-        if action == "take" and case["assigned_to"] is not None:
+        if not unrestricted and action == "take" and case["assigned_to"] is not None:
             raise ValueError("Zahtevek je že prevzel drug referent.")
 
-        if role == "vodja" and action == "manager_review":
+        if not unrestricted and role == "vodja" and action == "manager_review":
             if case["status"] != "predano_vodji":
                 raise PermissionError("Zahtevek ni predan vodji.")
 
-        if role == "referent" and action not in {"take"}:
+        if not unrestricted and role == "referent" and action not in {"take"}:
             if case["assigned_to"] != resource:
                 raise PermissionError(
                     "Pred obdelavo mora referent prevzeti zahtevek."
                 )
 
-        if action == "submit_completion" and case["applicant"] != resource:
+        if not unrestricted and action == "submit_completion" and case["applicant"] != resource:
             raise PermissionError("Dopolnitev lahko odda samo stranka zahtevka.")
+
+        if action == "approve" and case["znesek"] > REFERENT_LIMIT_EUR and not unrestricted:
+            raise PermissionError(
+                f"Referent lahko odobri zahtevke do {REFERENT_LIMIT_EUR:,.0f} EUR. Predajte jih vodji."
+            )
 
         if action == "submit_completion":
             if uploaded_file is None:
@@ -278,7 +302,7 @@ def apply_action(
                 document_type="dopolnitev dokumentacije",
                 file_prefix="dopolnitev",
             )
-            new_status = "v_pregledu" if not errors else "caka_na_dopolnitev"
+            new_status = "za_pregled" if not errors else "caka_na_dopolnitev"
             connection.execute(
                 """UPDATE cases SET znesek=?, vrsta_skode=?,
                    stevilka_police=? WHERE case_id=?""",
@@ -288,7 +312,7 @@ def apply_action(
 
         timestamp = now_iso()
 
-        if action == "take":
+        if action == "take" and role == "referent":
             connection.execute(
                 "UPDATE cases SET assigned_to = ? WHERE case_id = ?",
                 (resource, case_id),
@@ -359,6 +383,28 @@ def events_csv() -> str:
     return output.getvalue()
 
 
+def add_manual_event(case_id: str, activity: str, resource: str, role: str) -> None:
+    """Zabeleži ročni dogodek brez spremembe stanja zahtevka."""
+    activity = activity.strip()
+    if not activity:
+        raise ValueError("Vnesite ime dogodka.")
+    with get_connection() as connection:
+        case = connection.execute(
+            "SELECT * FROM cases WHERE case_id = ?", (case_id,)
+        ).fetchone()
+        if case is None:
+            raise ValueError("Zahtevek ne obstaja.")
+
+        if case["status"].startswith("zakljucen_"):
+            raise ValueError("Za zaključen zahtevek ni mogoče dodati dogodka.")
+        insert_event(
+            connection, case_id=case_id, activity=activity, timestamp=now_iso(),
+            resource=resource, role=role, source="manual", status=case["status"],
+            documents_complete=case["documents_complete"], znesek=case["znesek"],
+            vrsta_skode=case["vrsta_skode"], stevilka_police=case["stevilka_police"],
+        )
+
+
 def render_submission(identity: str) -> None:
     st.subheader("Oddaja zahtevka")
     st.caption("Izpolnite polja v PDF obrazcu in ga naložite. Podatkov ni treba prepisati.")
@@ -417,7 +463,22 @@ def render_cases(identity: str, role: str) -> None:
                 f"Dokument: {case['document_name']}"
             )
 
-            if role == "stranka" and case["status"] == "caka_na_dopolnitev":
+            if (
+                case["status"] == "za_pregled"
+                and case["assigned_to"] == identity
+                and role == "referent"
+            ) or (case["status"] == "za_pregled" and st.session_state.get("unrestricted_mode", False)):
+                if st.button("Preglej dopolnitev", key=f"review_{case['case_id']}"):
+                    try:
+                        apply_action(
+                            case["case_id"], "review", identity, role,
+                            unrestricted=st.session_state.get("unrestricted_mode", False),
+                        )
+                        st.rerun()
+                    except (ValueError, PermissionError) as error:
+                        st.error(str(error))
+
+            if (role == "stranka" and case["status"] == "caka_na_dopolnitev") or (st.session_state.get("unrestricted_mode", False) and case["status"] == "caka_na_dopolnitev"):
                 completion_document = st.file_uploader(
                     "PDF dopolnitve",
                     type=["pdf"],
@@ -431,15 +492,19 @@ def render_cases(identity: str, role: str) -> None:
                             identity,
                             role,
                             completion_document,
+                            unrestricted=st.session_state.get("unrestricted_mode", False),
                         )
                         st.success("Dopolnitev je sprejeta." if case["documents_complete"] else "Obrazec še ni popoln; zahtevek ostaja v dopolnitvi.")
                         st.rerun()
                     except (ValueError, PermissionError) as error:
                         st.error(str(error))
 
-            if (
+            unrestricted = st.session_state.get("unrestricted_mode", False)
+            terminal = case["status"].startswith("zakljucen_")
+
+            if not terminal and not unrestricted and (
                 role == "referent"
-                and case["status"] == "v_pregledu"
+                and case["status"] in {"v_pregledu", "caka_na_dopolnitev", "za_pregled"}
                 and case["assigned_to"] is None
             ):
                 if st.button(
@@ -447,16 +512,15 @@ def render_cases(identity: str, role: str) -> None:
                     key=f"take_{case['case_id']}",
                 ):
                     try:
-                        apply_action(case["case_id"], "take", identity, role)
+                        apply_action(case["case_id"], "take", identity, role, unrestricted=unrestricted)
                         st.rerun()
                     except (ValueError, PermissionError) as error:
                         st.error(str(error))
 
-            elif (
-                role == "referent"
-                and case["status"] == "v_pregledu"
+            elif not terminal and (unrestricted or (
+                role == "referent" and case["status"] == "v_pregledu"
                 and case["assigned_to"] == identity
-            ):
+            )):
                 buttons = [
                     ("Odobri", "approve"),
                     ("Zavrni", "reject"),
@@ -464,39 +528,59 @@ def render_cases(identity: str, role: str) -> None:
                     ("Predaj vodji", "handoff"),
                     ("Potrdi umik", "withdraw"),
                 ]
+                if unrestricted:
+                    if case["assigned_to"] is None:
+                        buttons.insert(0, ("Prevzemi zahtevek", "take"))
+                    buttons.append(("Odobri kot vodja", "manager_approve"))
+                    buttons.append(("Pregled vodje", "manager_review"))
+                if not unrestricted and case["znesek"] > REFERENT_LIMIT_EUR:
+                    buttons = [item for item in buttons if item[1] != "approve"]
                 cols = st.columns(len(buttons))
                 for column, (label, action) in zip(cols, buttons):
                     if column.button(label, key=f"{action}_{case['case_id']}"):
                         try:
-                            apply_action(case["case_id"], action, identity, role)
+                            apply_action(case["case_id"], action, identity, role, unrestricted=unrestricted)
                             st.rerun()
                         except (ValueError, PermissionError) as error:
                             st.error(str(error))
 
-            elif role == "vodja" and case["status"] == "predano_vodji":
+            elif not terminal and not unrestricted and role == "vodja" and case["status"] == "predano_vodji":
                 if st.button(
                     "Preglej zahtevek",
                     key=f"manager_review_{case['case_id']}",
                 ):
                     try:
                         apply_action(
-                            case["case_id"], "manager_review", identity, role
+                            case["case_id"], "manager_review", identity, role, unrestricted=unrestricted
                         )
                         st.rerun()
                     except (ValueError, PermissionError) as error:
                         st.error(str(error))
-            elif role == "vodja" and case["status"] == "v_pregledu":
+            elif not terminal and not unrestricted and role == "vodja" and case["status"] == "pregled_vodje":
                 if st.button(
                     "Odobri",
                     key=f"manager_approve_{case['case_id']}",
                 ):
                     try:
                         apply_action(
-                            case["case_id"], "manager_approve", identity, role
+                            case["case_id"], "manager_approve", identity, role, unrestricted=unrestricted
                         )
                         st.rerun()
                     except (ValueError, PermissionError) as error:
                         st.error(str(error))
+
+            if not terminal:
+                with st.expander("Zabeleži ročni dogodek"):
+                    options = [*MANUAL_EVENT_TYPES, "Drug dogodek …"]
+                    selected = st.selectbox("Vrsta dogodka", options, key=f"manual_type_{case['case_id']}")
+                    custom = st.text_input("Ime dogodka", key=f"manual_custom_{case['case_id']}") if selected == "Drug dogodek …" else ""
+                    if st.button("Zabeleži dogodek", key=f"manual_save_{case['case_id']}"):
+                        try:
+                            name = custom if selected == "Drug dogodek …" else selected
+                            add_manual_event(case["case_id"], name, identity, role)
+                            st.rerun()
+                        except ValueError as error:
+                            st.error(str(error))
 
 
 def render_event_log() -> None:
@@ -534,6 +618,12 @@ def main() -> None:
         st.divider()
         st.write(f"Prijavljen uporabnik: **{identity}**")
         st.write(f"Vloga: **{role}**")
+        st.checkbox(
+            "Način brez omejitev",
+            key="unrestricted_mode",
+            help="Omogoči izvedbo korakov mimo pravil vloge, praga in običajnega zaporedja. Zaključene zadeve ostanejo nespremenljive.",
+        )
+        st.caption(f"Prag odobritve referenta: {REFERENT_LIMIT_EUR:,.0f} EUR")
 
     if role == "stranka":
         render_submission(identity)
